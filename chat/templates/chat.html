@@ -1,0 +1,41 @@
+{% load static %}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat - File {{ current_file.id }}</title>
+    <link rel="stylesheet" href="{% static 'styles.css' %}">
+    <script src="{% static 'script.js' %}" defer></script>
+</head>
+<body>
+    <div class="chat-container">
+        <!-- Current File Chat -->
+        <div class="chat-box active-chat">
+            <h2>Chat for File {{ current_file.id }}</h2>
+            <p>Filename: <a href="{{ current_file.file.url }}" target="_blank">{{ current_file.file.name }}</a></p>
+            <div class="messages">
+                <p class="bot-msg">💬 Chat will appear here...</p>
+            </div>
+            <form class="chat-form">
+                <input type="text" placeholder="Type a message..." required>
+                <button type="submit">Send</button>
+            </form>
+        </div>
+
+        <!-- Other Chats -->
+        <div class="other-chats">
+            <h3>Other Uploaded Files</h3>
+            <ul>
+                {% for file in other_files %}
+                    <li>
+                        <a href="{% url 'chat' file.id %}">Chat for File {{ file.id }}</a>
+                    </li>
+                {% empty %}
+                    <li>No other files yet.</li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
