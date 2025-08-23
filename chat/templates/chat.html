@@ -1,41 +1,78 @@
 {% load static %}
+{% load socialaccount %}  <!-- Needed for Google login -->
 
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Chat - File {{ current_file.id }}</title>
-    <link rel="stylesheet" href="{% static 'styles.css' %}">
-    <script src="{% static 'script.js' %}" defer></script>
+  <meta charset="UTF-8" />
+  <title>Chat - File {{ current_file.id }}</title>
+  <link rel="stylesheet" href="{% static 'styles.css' %}" />
+  <script src="{% static 'script.js' %}" defer></script>
 </head>
 <body>
-    <div class="chat-container">
-        <!-- Current File Chat -->
-        <div class="chat-box active-chat">
-            <h2>Chat for File {{ current_file.id }}</h2>
-            <p>Filename: <a href="{{ current_file.file.url }}" target="_blank">{{ current_file.file.name }}</a></p>
-            <div class="messages">
-                <p class="bot-msg">💬 Chat will appear here...</p>
-            </div>
-            <form class="chat-form">
-                <input type="text" placeholder="Type a message..." required>
-                <button type="submit">Send</button>
-            </form>
-        </div>
 
-        <!-- Other Chats -->
-        <div class="other-chats">
-            <h3>Other Uploaded Files</h3>
-            <ul>
-                {% for file in other_files %}
-                    <li>
-                        <a href="{% url 'chat' file.id %}">Chat for File {{ file.id }}</a>
-                    </li>
-                {% empty %}
-                    <li>No other files yet.</li>
-                {% endfor %}
-            </ul>
-        </div>
+   <div class="navbar">
+    {% if user.is_authenticated %}
+      <span>👋 Welcome, {{ user.username }}</span>
+      <a href="{% url 'account_logout' %}">Logout</a>
+    {% else %}
+      <a href="{% provider_login_url 'google' %}">Login with Google</a>
+    {% endif %}
+  </div>
+ 
+
+  <div class="chat-container">
+    
+    <!-- Sidebar: Other Chats -->
+    <div class="other-chats">
+      <div class="back-btn">
+        <a href="{% url 'home' %}">⬅ Back to Home</a>
+      </div>
+      
+      <h3>📑 Other Uploaded Files</h3>
+      <ul>
+        {% for file in other_files %}
+        <li>
+          <a href="{% url 'chat' file.id %}" 
+             {% if file.id == current_file.id %}class="active"{% endif %}>
+            Chat for File {{ file.id }}
+          </a>
+        </li>
+        {% empty %}
+        <li style="color: var(--text-muted); padding: 12px 16px; font-size: 14px;">
+          No other files yet.
+        </li>
+        {% endfor %}
+      </ul>
     </div>
+
+    <!-- Main Chat Area -->
+    <div class="chat-box">
+      <h2>Chat for File {{ current_file.id }}</h2>
+      <p>
+        📄
+        <a href="{{ current_file.file.url }}" target="_blank">
+          {{ current_file.file.name }}
+        </a>
+      </p>
+
+      <!-- Chat messages -->
+      <div class="messages" id="messages">
+        <div class="message bot-msg">💬 Hi! Type your query about this document.</div>
+      </div>
+
+      <!-- Chat form -->
+      <form id="chat-form">
+        {% csrf_token %}
+        <textarea
+          id="user-input"
+          placeholder="Type a message..."
+          rows="1"
+          required
+        ></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </div>
+  </div>
 </body>
 </html>
