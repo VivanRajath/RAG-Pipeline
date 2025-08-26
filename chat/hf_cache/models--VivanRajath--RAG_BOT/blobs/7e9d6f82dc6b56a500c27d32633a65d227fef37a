@@ -1,0 +1,66 @@
+# rag_pipeline.py
+import os
+import faiss
+import numpy as np
+import google.generativeai as genai
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+
+class RAGPipeline:
+    def __init__(self):
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        self.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.global_index = None
+        self.session_indexes = {}
+
+    def encode_norm(self, texts):
+        return self.embedder.encode(texts, normalize_embeddings=True).astype("float32")
+
+    def load_and_chunk_pdf(self, file_path, chunk_size=500, overlap=50):
+        reader = PdfReader(file_path)
+        text = " ".join([page.extract_text() or "" for page in reader.pages])
+        return [
+            text[i:i+chunk_size] 
+            for i in range(0, len(text), chunk_size - overlap)
+        ]
+
+    def update_global_and_session_faiss(self, docs, session_id=None):
+        embeddings = self.encode_norm(docs)
+        dim = embeddings.shape[1]
+
+        if self.global_index is None:
+            self.global_index = faiss.IndexFlatIP(dim)
+        self.global_index.add(embeddings)
+
+        if session_id:
+            if session_id not in self.session_indexes:
+                self.session_indexes[session_id] = faiss.IndexFlatIP(dim)
+            self.session_indexes[session_id].add(embeddings)
+
+    def ask(self, query, session_id=None, k=3):
+        query_vec = self.encode_norm([query])
+        contexts = []
+
+        if session_id and session_id in self.session_indexes:
+            scores, idx = self.session_indexes[session_id].search(query_vec, k)
+            contexts = [f"Session: {idx.flatten()}"]
+
+        if self.global_index:
+            scores, idx = self.global_index.search(query_vec, k)
+            contexts += [f"Global: {idx.flatten()}"]
+
+        context_text = "\n".join(contexts)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([f"Context:\n{context_text}", query])
+        return response.text
+
+# --- Wrappers for Django compatibility ---
+rag = RAGPipeline()
+
+def process_file_with_rag(file_path, session_id):
+    docs = rag.load_and_chunk_pdf(file_path)
+    rag.update_global_and_session_faiss(docs, session_id)
+    return f"Added {len(docs)} chunks for session {session_id}"
+
+def ask_gemini(query, session_id=None):
+    return rag.ask(query, session_id)

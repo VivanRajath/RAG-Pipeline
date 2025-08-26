@@ -1,0 +1,174 @@
+import os
+import faiss
+import numpy as np
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load API key
+load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+class RAGPipeline:
+    def __init__(self, index_dir="rag_indexes"):
+        self.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.index_dir = index_dir
+        self.temp_index_dir = os.path.join(index_dir, "temp")
+        os.makedirs(self.index_dir, exist_ok=True)
+        os.makedirs(self.temp_index_dir, exist_ok=True)
+
+        self.global_index_path = os.path.join(index_dir, "global.index")
+        self.global_docs_path = os.path.join(index_dir, "global_docs.npy")
+
+    # --- Embedding ---
+    def encode_norm(self, texts):
+        return self.embedder.encode(texts, normalize_embeddings=True).astype("float32")
+
+    # --- FAISS helpers ---
+    def _new_ip_index(self, dim):
+        return faiss.IndexFlatIP(dim)
+
+    def _load_or_create_global_index(self, dim):
+        if os.path.exists(self.global_index_path) and os.path.getsize(self.global_index_path) > 0:
+            return faiss.read_index(self.global_index_path)
+        return self._new_ip_index(dim)
+
+    def _save_global_index(self, index):
+        faiss.write_index(index, self.global_index_path)
+
+    def _load_or_init_global_docs(self):
+        if os.path.exists(self.global_docs_path) and os.path.getsize(self.global_docs_path) > 0:
+            return np.load(self.global_docs_path, allow_pickle=True).tolist()
+        return []
+
+    def _save_global_docs(self, docs_list):
+        np.save(self.global_docs_path, docs_list)
+
+    # --- PDF Loader ---
+    def load_and_chunk_pdf(self, file_path, chunk_size=800, chunk_overlap=100):
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            if page.extract_text():
+                text += page.extract_text()
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = splitter.split_text(text)
+        return [c.strip() for c in chunks if c.strip()]
+
+    # --- Update FAISS ---
+    def update_global_and_session_faiss(self, docs, session_id):
+        if not docs: return False
+
+        embeddings = self.encode_norm(docs)
+        dim = embeddings.shape[1]
+
+        # Global
+        global_index = self._load_or_create_global_index(dim)
+        existing_docs = self._load_or_init_global_docs()
+
+        global_index.add(embeddings)
+        self._save_global_index(global_index)
+
+        all_docs = existing_docs + docs
+        self._save_global_docs(all_docs)
+
+        # Session
+        session_index = self._new_ip_index(dim)
+        session_index.add(embeddings)
+
+        session_index_path = os.path.join(self.temp_index_dir, f"{session_id}_index.faiss")
+        session_docs_path = os.path.join(self.temp_index_dir, f"{session_id}_docs.npy")
+
+        faiss.write_index(session_index, session_index_path)
+        np.save(session_docs_path, docs)
+
+        return True
+
+    # --- Load indices ---
+    def load_global_index_and_docs(self):
+        index = faiss.read_index(self.global_index_path)
+        docs = np.load(self.global_docs_path, allow_pickle=True)
+        return index, docs
+
+    def load_session_index(self, session_id):
+        session_index_path = os.path.join(self.temp_index_dir, f"{session_id}_index.faiss")
+        session_docs_path = os.path.join(self.temp_index_dir, f"{session_id}_docs.npy")
+        index = faiss.read_index(session_index_path)
+        docs = np.load(session_docs_path, allow_pickle=True)
+        return index, docs
+
+    # --- Retrieval ---
+    def retrieve_with_scores(self, query, index, docs, k=3):
+        q_emb = self.encode_norm([query])
+        scores, idxs = index.search(q_emb, k)
+        results = []
+        for score, idx in zip(scores[0], idxs[0]):
+            if idx == -1: continue
+            results.append((docs[idx], float(score)))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    # --- Query Gemini ---
+    def ask(self, query, session_id=None, k=3, sim_threshold=0.3):
+        # Session first
+        session_results = []
+        if session_id:
+            try:
+                s_index, s_docs = self.load_session_index(session_id)
+                session_results = self.retrieve_with_scores(query, s_index, s_docs, k)
+            except:
+                pass
+
+        session_results = [r for r in session_results if r[1] >= sim_threshold]
+
+        if session_results:
+            context = "\n\n---\n\n".join([doc for doc, _ in session_results])
+            prompt = f"""
+You are a helpful AI assistant.
+Answer using the uploaded document context below.
+
+Uploaded Document Context:
+{context}
+
+Question: {query}
+Answer clearly:
+""".strip()
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+
+        # Global fallback
+        try:
+            g_index, g_docs = self.load_global_index_and_docs()
+            global_results = self.retrieve_with_scores(query, g_index, g_docs, k)
+        except:
+            global_results = []
+
+        global_results = [r for r in global_results if r[1] >= sim_threshold]
+
+        if global_results:
+            context = "\n\n---\n\n".join([doc for doc, _ in global_results])
+            prompt = f"""
+You are a helpful AI assistant.
+Based on the GLOBAL knowledge base context below:
+
+Context:
+{context}
+
+Question: {query}
+Answer clearly:
+""".strip()
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+
+        return "❌ This query isn’t in the uploaded document or in the knowledge base."
+
+
+# --- Django wrappers ---
+rag = RAGPipeline()
+process_file_with_rag = rag.update_global_and_session_faiss
+ask_gemini = rag.ask
