@@ -7,83 +7,187 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+# --- Load API Key ---
 load_dotenv()
-
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# --- RAG Pipeline Class ---
+class RAGPipeline:
+    def __init__(self, index_dir="rag_indexes"):
+        self.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# --- Directories ---
-INDEX_DIR = "rag_indexes"
-os.makedirs(INDEX_DIR, exist_ok=True)
+        # Directories
+        self.index_dir = index_dir
+        self.temp_index_dir = os.path.join(index_dir, "temp")
+        os.makedirs(self.index_dir, exist_ok=True)
+        os.makedirs(self.temp_index_dir, exist_ok=True)
 
-GLOBAL_INDEX_PATH = os.path.join(INDEX_DIR, "global.index")
-GLOBAL_DOCS_PATH = os.path.join(INDEX_DIR, "global_docs.npy")
+        # Global paths
+        self.global_index_path = os.path.join(index_dir, "global.index")
+        self.global_docs_path = os.path.join(index_dir, "global_docs.npy")
 
-# --- PDF Loader ---
-def load_and_chunk_pdf(file_path, chunk_size=1000, chunk_overlap=200):
-    reader = PdfReader(file_path)
-    text = ""
-    for page in reader.pages:
-        if page.extract_text():
-            text += page.extract_text()
+    # --- Embedding helper ---
+    def encode_norm(self, texts):
+        return self.embedder.encode(texts, normalize_embeddings=True).astype("float32")
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
-    )
-    return text_splitter.split_text(text)
+    # --- FAISS utilities ---
+    def _new_ip_index(self, dim):
+        return faiss.IndexFlatIP(dim)
 
-# --- Global FAISS Update ---
-def update_global_faiss(docs):
-    doc_embeddings = embedder.encode(docs).astype("float32")
+    def _load_or_create_global_index(self, dim):
+        if os.path.exists(self.global_index_path) and os.path.getsize(self.global_index_path) > 0:
+            return faiss.read_index(self.global_index_path)
+        return self._new_ip_index(dim)
 
-    if os.path.exists(GLOBAL_INDEX_PATH):
-        index = faiss.read_index(GLOBAL_INDEX_PATH)
-        existing_docs = np.load(GLOBAL_DOCS_PATH, allow_pickle=True).tolist()
-    else:
-        dimension = doc_embeddings.shape[1]
-        index = faiss.IndexFlatL2(dimension)
-        existing_docs = []
+    def _save_global_index(self, index):
+        faiss.write_index(index, self.global_index_path)
 
-    index.add(doc_embeddings)
-    faiss.write_index(index, GLOBAL_INDEX_PATH)
+    def _load_or_init_global_docs(self):
+        if os.path.exists(self.global_docs_path) and os.path.getsize(self.global_docs_path) > 0:
+            return np.load(self.global_docs_path, allow_pickle=True).tolist()
+        return []
 
-    all_docs = existing_docs + docs
-    np.save(GLOBAL_DOCS_PATH, all_docs)
+    def _save_global_docs(self, docs_list):
+        np.save(self.global_docs_path, docs_list)
 
-# --- Process File ---
-def process_file_with_rag(file_path, file_id):
-    docs = load_and_chunk_pdf(file_path)
-    update_global_faiss(docs)
-    print(f"✅ Added {len(docs)} chunks from file {file_id} to global FAISS.")
+    # --- PDF Loader ---
+    def load_and_chunk_pdf(self, file_path, chunk_size=800, chunk_overlap=100):
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            if page.extract_text():
+                text += page.extract_text()
 
-# --- Query ---
-def load_global_index_and_docs():
-    index = faiss.read_index(GLOBAL_INDEX_PATH)
-    docs = np.load(GLOBAL_DOCS_PATH, allow_pickle=True)
-    return index, docs
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        chunks = splitter.split_text(text)
+        return [c.strip() for c in chunks if c and c.strip()]
 
-def retrieve(query, index, docs, k=3):
-    q_embedding = embedder.encode([query]).astype("float32")
-    D, I = index.search(q_embedding, k)
-    return [docs[i] for i in I[0]]
+    # --- Update FAISS ---
+    def update_global_and_session_faiss(self, docs, session_id):
+        if not docs:
+            return False
 
-def ask_gemini(query, k=3):
-    index, docs = load_global_index_and_docs()
-    relevant_chunks = retrieve(query, index, docs, k)
-    context = "\n\n".join(relevant_chunks)
+        doc_embeddings = self.encode_norm(docs)
+        dim = doc_embeddings.shape[1]
 
-    prompt = f"""You are an AI assistant.
-    Use the following document context to answer the user's question.
-    If the context does not contain the answer, say "I couldn't find that in the document."
+        # Global index update
+        global_index = self._load_or_create_global_index(dim)
+        existing_docs = self._load_or_init_global_docs()
 
-    Context:
-    {context}
+        global_index.add(doc_embeddings)
+        self._save_global_index(global_index)
 
-    Question: {query}
-    Answer:"""
+        all_docs = existing_docs + docs
+        self._save_global_docs(all_docs)
 
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
-    return response.text
+        # Session index
+        session_index = self._new_ip_index(dim)
+        session_index.add(doc_embeddings)
+
+        session_index_path = os.path.join(self.temp_index_dir, f"{session_id}_index.faiss")
+        session_docs_path = os.path.join(self.temp_index_dir, f"{session_id}_docs.npy")
+
+        faiss.write_index(session_index, session_index_path)
+        np.save(session_docs_path, docs)
+
+        return True
+
+    # --- Loaders ---
+    def load_global_index_and_docs(self):
+        if not os.path.exists(self.global_index_path) or not os.path.exists(self.global_docs_path):
+            raise FileNotFoundError("Global index/docs not found yet.")
+        index = faiss.read_index(self.global_index_path)
+        docs = np.load(self.global_docs_path, allow_pickle=True)
+        return index, docs
+
+    def load_session_index(self, session_id):
+        session_index_path = os.path.join(self.temp_index_dir, f"{session_id}_index.faiss")
+        session_docs_path = os.path.join(self.temp_index_dir, f"{session_id}_docs.npy")
+        if not os.path.exists(session_index_path) or not os.path.exists(session_docs_path):
+            raise FileNotFoundError("Session index/docs not found.")
+        index = faiss.read_index(session_index_path)
+        docs = np.load(session_docs_path, allow_pickle=True)
+        return index, docs
+
+    # --- Retrieval ---
+    def retrieve_with_scores(self, query, index, docs, k=3):
+        q_emb = self.encode_norm([query])
+        scores, idxs = index.search(q_emb, k)
+        results = []
+        for score, idx in zip(scores[0], idxs[0]):
+            if idx == -1: continue
+            results.append((docs[idx], float(score)))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    # --- Query Gemini ---
+    def ask(self, query, session_id=None, k=3, sim_threshold=0.3):
+        session_results = []
+        if session_id:
+            try:
+                s_index, s_docs = self.load_session_index(session_id)
+                session_results = self.retrieve_with_scores(query, s_index, s_docs, k)
+            except FileNotFoundError:
+                session_results = []
+
+        session_results = [r for r in session_results if r[1] >= sim_threshold]
+
+        if session_results:
+            context = "\n\n---\n\n".join([doc for doc, _ in session_results])
+            prompt = f"""
+You are a helpful AI assistant.
+Answer using the uploaded document context below.
+Do not invent anything outside this context.
+
+Uploaded Document Context:
+{context}
+
+Question: {query}
+Answer clearly:
+""".strip()
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+
+        # Fallback to global
+        try:
+            g_index, g_docs = self.load_global_index_and_docs()
+            global_results = self.retrieve_with_scores(query, g_index, g_docs, k)
+        except FileNotFoundError:
+            global_results = []
+
+        global_results = [r for r in global_results if r[1] >= sim_threshold]
+
+        if global_results:
+            context = "\n\n---\n\n".join([doc for doc, _ in global_results])
+            prompt = f"""
+You are a helpful AI assistant.
+I could not find relevant information in the uploaded document.
+Based on the GLOBAL knowledge base context below:
+
+Context:
+{context}
+
+Question: {query}
+Answer clearly:
+""".strip()
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+
+        return "❌ This query isn’t in the uploaded document or in the knowledge base."
+
+
+# --- Wrappers for Django views.py ---
+rag = RAGPipeline()
+
+def process_file_with_rag(file_path, session_id):
+    docs = rag.load_and_chunk_pdf(file_path)
+    rag.update_global_and_session_faiss(docs, session_id)
+    return f"Added {len(docs)} chunks for session {session_id}"
+
+def ask_gemini(query, session_id=None):
+    return rag.ask(query, session_id)
